@@ -11,7 +11,7 @@ import torch
 import torch.nn.functional as F
 
 
-# 1. First we have to normalize
+# 1. First we have to normalize and treat nans
 def normalize_image(img: torch.Tensor) -> torch.Tensor:
     """
     Normalize MARIDA patch that is already scaled (≈ 0.01 to 1.43).
@@ -68,6 +68,31 @@ def compute_dataset_stats(dataloader) -> Tuple[torch.Tensor, torch.Tensor]:
 
     return mean, std
 
+def set_low_conf_for_nan(
+    img: torch.Tensor,
+    conf: torch.Tensor,
+    low_conf_level: int = 3
+) -> Tuple[torch.Tensor, torch.Tensor]:
+    """
+    If a pixel has NaN in ANY band, set its confidence to low confidence 3.
+    Args:
+        img:  (C, H, W)
+        conf: (H, W)
+    Returns:
+        img_clean:  (C, H, W)
+        conf_new:   (H, W)
+    """
+    # Mask: True where any band = NaN or Inf
+    invalid = ~torch.isfinite(img)       
+    invalid_per_pixel = invalid.any(dim=0)  
+
+    conf_new = conf.clone()
+    conf_new[invalid_per_pixel] = low_conf_level
+
+    # Clean NaN/Inf from image so the model does not explode
+    img_clean = torch.nan_to_num(img, nan=0.0, posinf=0.0, neginf=0.0)
+
+    return img_clean, conf_new
 
 # 2. AUGMENTATIONS (flip + rotate)
 
