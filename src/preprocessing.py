@@ -168,7 +168,7 @@ def apply_ignore_index_to_target( target: torch.Tensor, ignore_mask: torch.Tenso
     return target_mod
 
 
-# 4. FLATTEN FOR RANDOM FOREST
+# 4. FLATTEN 
 
 
 def flatten_for_rf( img: torch.Tensor, mask: torch.Tensor, conf: Optional[torch.Tensor] = None, conf_threshold: int = 2,
