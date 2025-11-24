@@ -11,44 +11,16 @@ import torch
 import torch.nn.functional as F
 
 
-# 1. First we have to normalize
-
-
-def normalize_image(img: torch.Tensor, scale_factor: float = 10000.0, mean: Optional[torch.Tensor] = None, 
-                    std: Optional[torch.Tensor] = None,
-                    ) -> torch.Tensor:
+# 1. First we have to normalize and treat nans
+def normalize_image(img: torch.Tensor) -> torch.Tensor:
     """
-    Normalize a Sentinel image tensor
-    Args:
-        img:  Tensor (C, H, W). Can be int or float. C: Channels, H: Height, W: Width
-        scale_factor: if > 0, divide by this first (Sentinel-2 usually /10000).
-        mean: optional, band means. If None, only scaling is applied.
-        std:  optional, band std. If None, only scaling is applied.
-    Returns:
-        img_norm: Tensor (C, H, W), float32.
+    Normalize MARIDA patch that is already scaled (≈ 0.01 to 1.43).
+    We just convert to float (if it's not already, just to be safe), no scaling.
+    Converts the image to float, it Leaves values untouched, does not mess up the reflectance
+    and works with both RandomForest and U-Net
     """
-    if not torch.is_floating_point(img):
-        img = img.float()
+    return img.float()
 
-    if scale_factor is not None and scale_factor > 0:
-        img = img / scale_factor
-
-    # If no mean/std given, just return scaled image
-    if mean is None or std is None:
-        return img
-
-    # We make sure mean/std are tensors on same device
-    if not torch.is_tensor(mean):
-        mean = torch.tensor(mean, dtype=img.dtype, device=img.device)
-    if not torch.is_tensor(std):
-        std = torch.tensor(std, dtype=img.dtype, device=img.device)
-
-    std = torch.clamp(std, min=1e-6)
-    mean = mean.view(-1, 1, 1)
-    std = std.view(-1, 1, 1)
-
-    img = (img - mean) / std
-    return img
 
 
 def compute_dataset_stats(dataloader) -> Tuple[torch.Tensor, torch.Tensor]:
@@ -96,6 +68,31 @@ def compute_dataset_stats(dataloader) -> Tuple[torch.Tensor, torch.Tensor]:
 
     return mean, std
 
+def set_low_conf_for_nan(
+    img: torch.Tensor,
+    conf: torch.Tensor,
+    low_conf_level: int = 3
+) -> Tuple[torch.Tensor, torch.Tensor]:
+    """
+    If a pixel has NaN in ANY band, set its confidence to low confidence 3.
+    Args:
+        img:  (C, H, W)
+        conf: (H, W)
+    Returns:
+        img_clean:  (C, H, W)
+        conf_new:   (H, W)
+    """
+    # Mask: True where any band = NaN or Inf
+    invalid = ~torch.isfinite(img)       
+    invalid_per_pixel = invalid.any(dim=0)  
+
+    conf_new = conf.clone()
+    conf_new[invalid_per_pixel] = low_conf_level
+
+    # Clean NaN/Inf from image so the model does not explode
+    img_clean = torch.nan_to_num(img, nan=0.0, posinf=0.0, neginf=0.0)
+
+    return img_clean, conf_new
 
 # 2. AUGMENTATIONS (flip + rotate)
 
@@ -171,7 +168,7 @@ def apply_ignore_index_to_target( target: torch.Tensor, ignore_mask: torch.Tenso
     return target_mod
 
 
-# 4. FLATTEN FOR RANDOM FOREST
+# 4. FLATTEN 
 
 
 def flatten_for_rf( img: torch.Tensor, mask: torch.Tensor, conf: Optional[torch.Tensor] = None, conf_threshold: int = 2,
@@ -189,11 +186,11 @@ def flatten_for_rf( img: torch.Tensor, mask: torch.Tensor, conf: Optional[torch.
     """
     C, H, W = img.shape
     img = img.float()
-    X = img.view(C, -1).T          # (H*W, C)
-    y = mask.view(-1)              # (H*W,)
-
+    X = img.reshape(C, -1).T          # (H*W, C)
+    y = mask.reshape(-1)              # (H*W,)
+    #we used reshape() instead of view() because img, mask and conf may become non contiguous in memory after augmentations
     if conf is not None:
-        conf_flat = conf.view(-1)
+        conf_flat = conf.reshape(-1)
         keep = conf_flat <= conf_threshold
         X = X[keep]
         y = y[keep]
@@ -219,7 +216,7 @@ if __name__ == "__main__":
     print(f"Original conf shape: {conf.shape}")
 
     # 1) Test normalization
-    img_norm = normalize_image(img, scale_factor=10000.0)
+    img_norm = normalize_image(img)
     print(f"After normalize_image -> min={img_norm.min():.4f}, max={img_norm.max():.4f}")
 
     # 2) Test augmentations
