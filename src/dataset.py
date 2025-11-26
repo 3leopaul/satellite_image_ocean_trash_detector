@@ -77,6 +77,6 @@ class MaridaDatasetLoader:
         conf = torch.tensor(conf, dtype=torch.long)
 
         if self.transform:
-            img, mask, conf = self.transform(img, mask, conf)
+            img, mask, conf = self.transform(img, mask, conf) 
 
         return img, mask, conf
