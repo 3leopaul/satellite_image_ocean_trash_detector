@@ -4,7 +4,8 @@
 #   - confidence-based ignore mask
 #   - flatten_for_rf
 # And at the bottom there is a small TEST using fake data.
-
+import os
+os.environ['CUDA_LAUNCH_BLOCKING'] = "1"
 from mock_dataset import MockDataset
 from typing import Tuple, Optional
 import torch

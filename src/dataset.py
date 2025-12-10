@@ -1,4 +1,5 @@
 import os
+os.environ['CUDA_LAUNCH_BLOCKING'] = "1"
 import torch
 from torch.utils.data import Dataset
 import rasterio
