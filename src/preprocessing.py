@@ -1,9 +1,10 @@
-# This is the preprocessing files it defines:
+# Ce fichier définit les fonctions de prétraitement suivantes :
 #   - normalize_image
-#   - simple augmentations (flip, rotate)
-#   - confidence-based ignore mask
-#   - flatten_for_rf
-# And at the bottom there is a small TEST using fake data.
+#   - augmentations simples (flip, rotation)
+#   - masque d’ignorance basé sur la confiance
+#   - flatten_for_rf (mise à plat pour RandomForest)
+# Et à la fin un petit TEST utilisant des données factices.
+
 import os
 os.environ['CUDA_LAUNCH_BLOCKING'] = "1"
 from mock_dataset import MockDataset
@@ -12,46 +13,65 @@ import torch
 import torch.nn.functional as F
 
 
-# 1. First we have to normalize and treat nans
+# 1. Normalisation + traitement des NaN
 def normalize_image(img: torch.Tensor) -> torch.Tensor:
     """
-    Normalize MARIDA patch that is already scaled (≈ 0.01 to 1.43).
-    We just convert to float (if it's not already, just to be safe), no scaling.
-    Converts the image to float, it Leaves values untouched, does not mess up the reflectance
-    and works with both RandomForest and U-Net
+    Normalise un patch MARIDA en appliquant :
+    1) Un clipping des valeurs physiques dans [0, 1]
+       (corrige les valeurs légèrement négatives ou >1 dues à la correction atmosphérique)
+    2) Une normalisation min-max par bande pour ramener chaque bande dans [0, 1]
+
+    Cette normalisation est adaptée aux modèles U-Net et stabilise fortement l'entraînement.
     """
-    return img.float()
+
+    img = img.float()
+
+    # Étape 1 : Clamping dans la plage [0,1]
+    img = torch.clamp(img, 0.0, 1.0)
+
+    # Étape 2 : Normalisation min-max par bande
+    # img a la forme (C, H, W)
+    bands_min = img.amin(dim=(1, 2), keepdim=True)
+    bands_max = img.amax(dim=(1, 2), keepdim=True)
+
+    # éviter une division par zéro
+    denom = (bands_max - bands_min).clamp(min=1e-6)
+
+    img = (img - bands_min) / denom
+
+    return img
+
 
 
 
 def compute_dataset_stats(dataloader) -> Tuple[torch.Tensor, torch.Tensor]:
     """
-    Compute per-band mean and std over a dataloader of images.
-    Assumes dataloader yields (image, mask, conf) where:
-        image: (B, C, H, W) or (C, H, W) - B: Batch size
+    Calcule la moyenne et l’écart-type par bande sur un dataloader d’images.
+    Suppose que le dataloader renvoie (image, mask, conf) où :
+        image : (B, C, H, W) ou (C, H, W)
     """
     n_pixels = 0
     sum_ = None
     sum_sq = None
 
     for batch in dataloader:
-        # batch can be (img, mask, conf) or dict
+        # batch peut être (img, mask, conf) ou un dict
         if isinstance(batch, (list, tuple)):
             imgs = batch[0]
         elif isinstance(batch, dict):
             imgs = batch["image"]
         else:
-            raise ValueError("Unsupported batch type for stats computation")
+            raise ValueError("Type de batch non supporté pour le calcul des statistiques.")
 
         if imgs.dim() == 3:  # (C,H,W) -> (1,C,H,W)
             imgs = imgs.unsqueeze(0)
 
-        imgs = imgs.float()  # (B,C,H,W)
+        imgs = imgs.float()
         B, C, H, W = imgs.shape
         pixels_in_batch = B * H * W
 
         imgs_flat = imgs.view(B, C, -1)  # (B, C, H*W)
-        batch_sum = imgs_flat.sum(dim=(0, 2))      # (C,)
+        batch_sum = imgs_flat.sum(dim=(0, 2))            # (C,)
         batch_sum_sq = (imgs_flat ** 2).sum(dim=(0, 2))  # (C,)
 
         if sum_ is None:
@@ -69,61 +89,73 @@ def compute_dataset_stats(dataloader) -> Tuple[torch.Tensor, torch.Tensor]:
 
     return mean, std
 
+
+
 def set_low_conf_for_nan(
     img: torch.Tensor,
     conf: torch.Tensor,
     low_conf_level: int = 3
 ) -> Tuple[torch.Tensor, torch.Tensor]:
     """
-    If a pixel has NaN in ANY band, set its confidence to low confidence 3.
+    Si un pixel contient un NaN dans AU MOINS une bande,
+    on définit sa confiance au niveau faible (3).
+
     Args:
         img:  (C, H, W)
         conf: (H, W)
     Returns:
-        img_clean:  (C, H, W)
-        conf_new:   (H, W)
+        img_clean: (C, H, W) sans NaN/Inf
+        conf_new:  (H, W) avec pixels invalides marqués comme faible confiance
     """
-    # Mask: True where any band = NaN or Inf
-    invalid = ~torch.isfinite(img)       
-    invalid_per_pixel = invalid.any(dim=0)  
+    # True là où une bande = NaN ou Inf
+    invalid = ~torch.isfinite(img)
+    invalid_per_pixel = invalid.any(dim=0)
 
     conf_new = conf.clone()
     conf_new[invalid_per_pixel] = low_conf_level
 
-    # Clean NaN/Inf from image so the model does not explode
+    # Remplacement des NaN/Inf pour éviter les explosions numériques
     img_clean = torch.nan_to_num(img, nan=0.0, posinf=0.0, neginf=0.0)
 
     return img_clean, conf_new
 
-# 2. AUGMENTATIONS (flip + rotate)
 
-def apply_augmentations( img: torch.Tensor, mask: torch.Tensor, conf: Optional[torch.Tensor] = None, p_hflip: float = 0.5,
-    p_vflip: float = 0.5, p_rotate90: float = 0.5,
-    ) -> Tuple[torch.Tensor, torch.Tensor, Optional[torch.Tensor]]:
+
+# 2. AUGMENTATIONS (flip + rotation)
+
+def apply_augmentations(
+    img: torch.Tensor,
+    mask: torch.Tensor,
+    conf: Optional[torch.Tensor] = None,
+    p_hflip: float = 0.5,
+    p_vflip: float = 0.5,
+    p_rotate90: float = 0.5,
+) -> Tuple[torch.Tensor, torch.Tensor, Optional[torch.Tensor]]:
     """
-    augmentations applied consistently on img, mask, conf.
+    Applique des augmentations de manière cohérente sur img, mask, et conf.
     Args:
         img:  (C, H, W)
         mask: (H, W)
-        conf: (H, W) or None
+        conf: (H, W) ou None
     """
-    # Horizontal flip (left-right)
+
+    # Flip horizontal
     if torch.rand(1).item() < p_hflip:
-        img = torch.flip(img, dims=[2])   # flip width axis
+        img = torch.flip(img, dims=[2])
         mask = torch.flip(mask, dims=[1])
         if conf is not None:
             conf = torch.flip(conf, dims=[1])
 
-    # Vertical flip (up-down)
+    # Flip vertical
     if torch.rand(1).item() < p_vflip:
-        img = torch.flip(img, dims=[1])   # flip height axis
+        img = torch.flip(img, dims=[1])
         mask = torch.flip(mask, dims=[0])
         if conf is not None:
             conf = torch.flip(conf, dims=[0])
 
-    # Random rotation by k * 90 degrees
+    # Rotation aléatoire de k * 90°
     if torch.rand(1).item() < p_rotate90:
-        k = torch.randint(low=0, high=4, size=(1,)).item()  # 0,1,2,3
+        k = torch.randint(low=0, high=4, size=(1,)).item()
         if k > 0:
             img = torch.rot90(img, k=k, dims=(1, 2))
             mask = torch.rot90(mask, k=k, dims=(0, 1))
@@ -133,105 +165,81 @@ def apply_augmentations( img: torch.Tensor, mask: torch.Tensor, conf: Optional[t
     return img, mask, conf
 
 
-# 3. CONFIDENCE HANDLING
 
+# 3. GESTION DE LA CONFIANCE (IGNORE MASK)
 
-def build_conf_ignore_mask(conf: torch.Tensor, threshold: int = 2,
-    ) -> torch.Tensor:
+def build_conf_ignore_mask(
+    conf: torch.Tensor,
+    threshold: int = 2,
+) -> torch.Tensor:
     """
-    Build a boolean mask where pixels with confidence > threshold are ignored.
-    1: High - keep
-    2: Moderate - keep
-    3: Low - we ignore
+    Construit un masque booléen où les pixels avec confiance > threshold sont ignorés.
+    Confiance :
+        1 : Haute → garder
+        2 : Modérée → garder
+        3 : Faible → ignorer
     Args:
-        conf: (H, W) integer confidence levels.
-        threshold: keep pixels with conf <= threshold.
+        conf: (H, W)
+        threshold: garde les pixels avec conf <= threshold.
     Returns:
-        ignore_mask: (H, W) bool tensor, True = IGNORE this pixel.
+        ignore_mask: (H, W) bool, True = IGNORER le pixel.
     """
     ignore_mask = conf > threshold
     return ignore_mask
 
 
-def apply_ignore_index_to_target( target: torch.Tensor, ignore_mask: torch.Tensor, ignore_index: int = -100,
-    ) -> torch.Tensor:
+
+def apply_ignore_index_to_target(
+    target: torch.Tensor,
+    ignore_mask: torch.Tensor,
+    ignore_index: int = -100,
+) -> torch.Tensor:
     """
-    The function sets target pixels to ignore_index where ignore_mask is True.
+    Remplace dans la cible les pixels à ignorer par ignore_index.
     Args:
-        target: (H, W) class ids.
-        ignore_mask: (H, W) bool.
-        ignore_index: value used in loss 
+        target: (H, W) labels de classes
+        ignore_mask: (H, W) bool
+        ignore_index: valeur spéciale utilisée dans la loss
     Returns:
-        target_mod: (H, W) with some pixels set to ignore_index.
+        target_mod: (H, W)
     """
     target_mod = target.clone()
     target_mod[ignore_mask] = ignore_index
     return target_mod
 
 
-# 4. FLATTEN 
-
-
-def flatten_for_rf( img: torch.Tensor, mask: torch.Tensor, conf: Optional[torch.Tensor] = None, conf_threshold: int = 2,
-    ) -> Tuple[torch.Tensor, torch.Tensor]:
-    """
-    Flatten image + mask into pixel-level examples for RandomForest.
-    Args:
-        img:  (C, H, W)
-        mask: (H, W)
-        conf: (H, W) or None
-        conf_threshold: keep pixels with conf <= threshold.
-    Returns:
-        X: (N, C) tensor of features (per-pixel bands)
-        y: (N,) tensor of labels
-    """
-    C, H, W = img.shape
-    img = img.float()
-    X = img.reshape(C, -1).T          # (H*W, C)
-    y = mask.reshape(-1)              # (H*W,)
-    #we used reshape() instead of view() because img, mask and conf may become non contiguous in memory after augmentations
-    if conf is not None:
-        conf_flat = conf.reshape(-1)
-        keep = conf_flat <= conf_threshold
-        X = X[keep]
-        y = y[keep]
-
-    return X, y
 
 
 
-# 5. Small fake test
 
+# 5. Petit test avec données factices
 
 if __name__ == "__main__":
-    print("\n\n Fake test - preprocessing.py \n")
+    print("\n\n Test factice - preprocessing.py \n")
 
-    # Fake MARIDA patch
+    # Faux patch MARIDA
     C, H, W = 10, 256, 256
-    img = torch.randint(0, 10000, (C, H, W))  # like raw Sentinel-2 DN values
+    img = torch.randint(0, 10000, (C, H, W))  # valeurs DN style Sentinel-2 brut
     mask = torch.randint(0, 15, (H, W))       # 15 classes
-    conf = torch.randint(1, 4, (H, W))        # confidence 0..3
+    conf = torch.randint(1, 4, (H, W))        # niveaux de confiance 1..3
 
-    print(f"Original img shape: {img.shape}")
-    print(f"Original mask shape: {mask.shape}")
-    print(f"Original conf shape: {conf.shape}")
+    print(f"Shape image originale : {img.shape}")
+    print(f"Shape mask original : {mask.shape}")
+    print(f"Shape conf originale : {conf.shape}")
 
-    # 1) Test normalization
+    # 1) Test normalisation
     img_norm = normalize_image(img)
-    print(f"After normalize_image -> min={img_norm.min():.4f}, max={img_norm.max():.4f}")
+    print(f"Après normalize_image → min={img_norm.min():.4f}, max={img_norm.max():.4f}")
 
     # 2) Test augmentations
     img_aug, mask_aug, conf_aug = apply_augmentations(img_norm, mask, conf)
-    print(f"After augmentations -> img: {img_aug.shape}, mask: {mask_aug.shape}, conf: {conf_aug.shape}")
+    print(f"Après augmentations → img: {img_aug.shape}, mask: {mask_aug.shape}, conf: {conf_aug.shape}")
 
-    # 3) Test confidence mask
+    # 3) Test du ignore_mask basé sur confiance
     ignore_mask = build_conf_ignore_mask(conf_aug, threshold=2)
     mask_ignored = apply_ignore_index_to_target(mask_aug, ignore_mask, ignore_index=-100)
-    print(f"Ignore_mask true count: {ignore_mask.sum().item()} pixels")
-    print(f"mask_ignored unique values (sample): {torch.unique(mask_ignored)[:10]}")
+    print(f"Pixels ignorés (True) : {ignore_mask.sum().item()}")
+    print(f"Valeurs uniques dans mask_ignored (extrait) : {torch.unique(mask_ignored)[:10]}")
 
-    # 4) Test flatten_for_rf
-    X_rf, y_rf = flatten_for_rf(img_aug, mask_aug, conf_aug, conf_threshold=2)
-    print(f"RandomForest features shape: X={X_rf.shape}, y={y_rf.shape}")
 
-    print("\n Fake test finished !!!")
+    print("\n Test factice terminé !")
