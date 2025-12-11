@@ -7,7 +7,6 @@
 
 import os
 os.environ['CUDA_LAUNCH_BLOCKING'] = "1"
-from mock_dataset import MockDataset
 from typing import Tuple, Optional
 import torch
 import torch.nn.functional as F
@@ -16,28 +15,16 @@ import torch.nn.functional as F
 # 1. Normalisation + traitement des NaN
 def normalize_image(img: torch.Tensor) -> torch.Tensor:
     """
-    Normalise un patch MARIDA en appliquant :
-    1) Un clipping des valeurs physiques dans [0, 1]
-       (corrige les valeurs légèrement négatives ou >1 dues à la correction atmosphérique)
-    2) Une normalisation min-max par bande pour ramener chaque bande dans [0, 1]
-
-    Cette normalisation est adaptée aux modèles U-Net et stabilise fortement l'entraînement.
+    Dans des premiers tests, nous normalisions les images en limitant les valeurs des pixels entre 0 et 1.
+    Nous avons remarqué plus tard que cette normalisation n'était pas nécessaire et même nuisible,
+    elle nous faisait perdre des informations importantes
+    qui nous permettait de distinguer les debris des objets clairs.
+    Nous nous contenterons donc de convertir les images en float.
     """
 
     img = img.float()
 
-    # Étape 1 : Clamping dans la plage [0,1]
-    img = torch.clamp(img, 0.0, 1.0)
 
-    # Étape 2 : Normalisation min-max par bande
-    # img a la forme (C, H, W)
-    bands_min = img.amin(dim=(1, 2), keepdim=True)
-    bands_max = img.amax(dim=(1, 2), keepdim=True)
-
-    # éviter une division par zéro
-    denom = (bands_max - bands_min).clamp(min=1e-6)
-
-    img = (img - bands_min) / denom
 
     return img
 
